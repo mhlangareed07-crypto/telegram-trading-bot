@@ -1063,13 +1063,22 @@ def main() -> None:
     init_db()
     keep_alive()
     logging.info("Liquidity Phantom Bot (analysis engine) starting...")
-    try:
-        bot.infinity_polling(skip_pending=True, timeout=10, long_polling_timeout=10)
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by user.")
-    except Exception:
-        logging.exception("The bot stopped because of an unexpected error.")
-        raise
+    
+    while True:
+        try:
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=20,
+                long_polling_timeout=20,
+                non_stop=True
+            )
+        except Exception as e:
+            logging.error(f"Polling error encountered: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":
