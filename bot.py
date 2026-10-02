@@ -20,8 +20,8 @@ from telebot import types
 # ============================================================
 # CONFIG
 # ============================================================
-BOT_TOKEN = "8686284897:AAHntaD1FtwY8FOojnCFSEdApjXQSudHBPM"
-TWELVE_DATA_API_KEY = "5288e6a3d6c64135bbab2c360bc40747"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
 
 SYMBOL = "XAU/USD"
 DEFAULT_INTERVAL = "15min"
