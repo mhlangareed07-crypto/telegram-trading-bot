@@ -772,6 +772,25 @@ def cmd_signal(message):
     else:
         bot.send_message(message.chat.id, text)
 
+@bot.message_handler(commands=["scan"])
+def cmd_scan(message):
+    candles, err = fetch_candles()
+    if err:
+        bot.reply_to(message, f"⚠️ {err}")
+        return
+    setup = build_ict_setup(candles)
+    if setup.get("state") == "ENTRY":
+        bot.send_message(message.chat.id, render_setup(candles))
+    elif setup.get("state") == "DEVELOPING":
+        bot.send_message(message.chat.id, render_setup(candles))
+    else:
+        bot.reply_to(
+            message,
+            "🟡 <b>No signal yet.</b>\n"
+            "No liquidity raid → MSS → displacement → FVG sequence in the current window.\n"
+            "<i>Auto-scan runs every 10 minutes and will notify you when one appears.</i>",
+        )
+
 
 @bot.message_handler(commands=["debug"])
 def cmd_debug(message):
