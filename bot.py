@@ -1076,9 +1076,293 @@ def main() -> None:
             logging.error(f"Polling error encountered: {e}. Retrying in 5 seconds...")
             time.sleep(5)
 
-if __name__ == "__main__":
-    main()
 
+# ============================================================================
+# ICT EXTENSION — sequence-aware setup recognition (SSL/BSL raid → displacement
+# → MSS → FVG/PD array → retracement → entry). Namespaced ICT_.
+# ============================================================================
+
+ICT_VALIDITY_CANDLES = 40
+ICT_SCAN_LOOKBACK = 150
+ICT_FVG_SEARCH_PAD = 5
+
+
+def ICT_previous_session_high_low(candles):
+    now_sast = candles[-1]["dt"].astimezone(SAST)
+    windows = []
+    for name, tzname, start_h, end_h in SESSION_DEFS:
+        tz = ZoneInfo(tzname)
+        for day_offset in (0, -1):
+            d = (now_sast + timedelta(days=day_offset)).astimezone(tz).date()
+            start_local = datetime(d.year, d.month, d.day, start_h, 0, tzinfo=tz)
+            end_local = datetime(d.year, d.month, d.day, end_h, 0, tzinfo=tz)
+            windows.append((name, start_local.astimezone(SAST), end_local.astimezone(SAST)))
+    completed = [w for w in windows if w[2] < now_sast]
+    if not completed:
+        return None, None, None
+    completed.sort(key=lambda w: w[2], reverse=True)
+    name, start, end = completed[0]
+    in_session = [c for c in candles if start <= c["dt"].astimezone(SAST) <= end]
+    if not in_session:
+        return None, None, name
+    return max(c["high"] for c in in_session), min(c["low"] for c in in_session), name
+
+
+def ICT_liquidity_pools(candles, swings):
+    pools = []
+    for p in find_equal_levels(swings, "high"):
+        pools.append({"type": "BSL", "price": p, "source": "equal highs"})
+    for p in find_equal_levels(swings, "low"):
+        pools.append({"type": "SSL", "price": p, "source": "equal lows"})
+    pdh, pdl = previous_day_high_low(candles)
+    if pdh:
+        pools.append({"type": "BSL", "price": pdh, "source": "PDH"})
+        pools.append({"type": "SSL", "price": pdl, "source": "PDL"})
+    psh, psl, sess_name = ICT_previous_session_high_low(candles)
+    if psh:
+        pools.append({"type": "BSL", "price": psh, "source": f"previous {sess_name} session high"})
+        pools.append({"type": "SSL", "price": psl, "source": f"previous {sess_name} session low"})
+    return pools
+
+
+def ICT_find_raids(candles, pools, lookback=ICT_SCAN_LOOKBACK, confirm_within=3):
+    start = max(0, len(candles) - lookback)
+    events = []
+    for pool in pools:
+        level = pool["price"]
+        direction = "high" if pool["type"] == "BSL" else "low"
+        for i in range(start, len(candles)):
+            c = candles[i]
+            beyond = (c["high"] > level) if direction == "high" else (c["low"] < level)
+            if not beyond:
+                continue
+            for j in range(i + 1, min(i + 1 + confirm_within, len(candles))):
+                back_inside = (candles[j]["close"] < level) if direction == "high" else (candles[j]["close"] > level)
+                if back_inside:
+                    events.append({"idx": j, "raid_idx": i, "pool": pool,
+                                   "reversal_direction": "bullish" if pool["type"] == "SSL" else "bearish"})
+                    break
+    events.sort(key=lambda e: e["idx"], reverse=True)
+    return events
+
+
+def ICT_find_mss(candles, raid_idx, direction, window):
+    end = min(raid_idx + window, len(candles) - 1)
+    pre_swings = find_swings(candles[: raid_idx + 1])
+    if direction == "bullish":
+        prior_highs = [s["price"] for s in pre_swings if s["type"] == "high"]
+        if not prior_highs:
+            return None
+        mss_level = prior_highs[-1]
+        for j in range(raid_idx + 1, end + 1):
+            if candles[j]["close"] > mss_level:
+                return {"idx": j, "level": mss_level}
+    else:
+        prior_lows = [s["price"] for s in pre_swings if s["type"] == "low"]
+        if not prior_lows:
+            return None
+        mss_level = prior_lows[-1]
+        for j in range(raid_idx + 1, end + 1):
+            if candles[j]["close"] < mss_level:
+                return {"idx": j, "level": mss_level}
+    return None
+
+
+def ICT_find_displacement(candles, start_idx, end_idx, direction):
+    atr = average_true_range(candles[: end_idx + 1]) or 0
+    for j in range(start_idx, end_idx + 1):
+        c = candles[j]
+        body = abs(c["close"] - c["open"])
+        rng = c["high"] - c["low"]
+        body_ratio = (body / rng) if rng else 0
+        cand_dir = "bullish" if c["close"] > c["open"] else "bearish"
+        if cand_dir == direction and body > DISPLACEMENT_ATR_MULT * atr and body_ratio > DISPLACEMENT_BODY_RATIO:
+            return {"idx": j, "body": body, "atr": atr}
+    return None
+
+
+def ICT_find_fvg_near(candles, start_idx, end_idx, direction):
+    end = min(end_idx + ICT_FVG_SEARCH_PAD, len(candles) - 1)
+    window = candles[max(0, start_idx - 1): end + 1]
+    offset = max(0, start_idx - 1)
+    fvgs = detect_fvgs(window)
+    matching = [f for f in fvgs if f["type"] == direction]
+    if not matching:
+        return None
+    best = min(matching, key=lambda f: abs((f["i"] + offset) - start_idx))
+    best = dict(best)
+    best["i"] += offset
+    return best
+
+
+def ICT_fvg_filled_before_last(candles, fvg):
+    for c in candles[fvg["i"] + 1: -1]:
+        if fvg["bottom"] <= c["low"] <= fvg["top"] or fvg["bottom"] <= c["high"] <= fvg["top"]:
+            return True
+    return False
+
+
+def ICT_find_order_block(candles, raid_idx, mss_idx, direction):
+    for i in range(mss_idx - 1, raid_idx - 1, -1):
+        c = candles[i]
+        if direction == "bullish" and c["close"] < c["open"]:
+            return {"type": "bullish OB", "high": c["high"], "low": c["low"], "idx": i}
+        if direction == "bearish" and c["close"] > c["open"]:
+            return {"type": "bearish OB", "high": c["high"], "low": c["low"], "idx": i}
+    return None
+
+
+def ICT_check_invalidated(candles, raid, mss, direction):
+    raid_extreme = raid["pool"]["price"]
+    for j in range(mss["idx"] + 1, len(candles)):
+        c = candles[j]
+        if direction == "bullish" and c["close"] < raid_extreme:
+            return True
+        if direction == "bearish" and c["close"] > raid_extreme:
+            return True
+    return False
+
+
+def ICT_price_in_zone(candles, zone_low, zone_high):
+    last = candles[-1]
+    return last["low"] <= zone_high and last["high"] >= zone_low
+
+
+def ICT_build_setup(candles):
+    structure = market_structure_report(candles)
+    swings = structure["swings"]
+    pools = ICT_liquidity_pools(candles, swings)
+    raids = ICT_find_raids(candles, pools)
+
+    for raid in raids:
+        direction = raid["reversal_direction"]
+        mss = ICT_find_mss(candles, raid["idx"], direction, ICT_VALIDITY_CANDLES)
+        if not mss:
+            continue
+        displacement = ICT_find_displacement(candles, raid["idx"] + 1, mss["idx"], direction)
+        if not displacement:
+            continue
+        fvg = ICT_find_fvg_near(candles, mss["idx"], mss["idx"], direction)
+        if not fvg:
+            continue
+        if ICT_check_invalidated(candles, raid, mss, direction):
+            continue
+
+        ob = ICT_find_order_block(candles, raid["idx"], mss["idx"], direction)
+        zone_low, zone_high = fvg["bottom"], fvg["top"]
+        in_zone_now = ICT_price_in_zone(candles, zone_low, zone_high)
+        candles_since_mss = (len(candles) - 1) - mss["idx"]
+        still_valid_window = candles_since_mss <= ICT_VALIDITY_CANDLES
+
+        pd = premium_discount_report(candles, max(raid["pool"]["price"], mss["level"]),
+                                      min(raid["pool"]["price"], mss["level"]))
+
+        setup = {
+            "direction": direction,
+            "pool": raid["pool"],
+            "raid_idx": raid["idx"],
+            "mss": mss,
+            "displacement": displacement,
+            "fvg": fvg,
+            "fvg_is_inversion": ICT_fvg_filled_before_last(candles, fvg),
+            "order_block": ob,
+            "premium_discount": pd,
+            "session_at_raid": LPX_active_session_label(candles[raid["idx"]]["dt"].astimezone(SAST)),
+            "session_now": LPX_active_session_label(candles[-1]["dt"].astimezone(SAST)),
+            "candles_since_mss": candles_since_mss,
+        }
+
+        if in_zone_now and still_valid_window:
+            setup["state"] = "ENTRY"
+            return setup
+        if still_valid_window:
+            setup["state"] = "DEVELOPING"
+            return setup
+        continue
+
+    return {"state": "NONE"}
+
+
+def ICT_format_setup(setup: dict) -> str:
+    if setup["state"] == "NONE":
+        return (
+            "🎯 <b>ICT SETUP — XAUUSD</b>\n\n"
+            "⚪ No developing ICT setup found right now.\n\n"
+            "No liquidity raid in the recent lookback led to a confirmed MSS "
+            "with displacement and an FVG that is still inside its validity window."
+        )
+
+    direction = setup["direction"]
+    icon = "🟢" if direction == "bullish" else "🔴"
+    pool = setup["pool"]
+    fvg = setup["fvg"]
+    ob = setup["order_block"]
+    pd = setup["premium_discount"]
+
+    raid_label = f"{pool['type']} raid at {fmt_price(pool['price'])} ({pool['source']})"
+    mss_label = f"MSS confirmed {direction} (broke {fmt_price(setup['mss']['level'])})"
+    disp_label = f"Displacement confirmed {direction}"
+    fvg_kind = "Inversion FVG" if setup["fvg_is_inversion"] else "FVG"
+    fvg_label = f"{fvg_kind} ({direction}) — {fmt_price(fvg['bottom'])} to {fmt_price(fvg['top'])}"
+    ob_label = f"{ob['type']} — {fmt_price(ob['low'])} to {fmt_price(ob['high'])}" if ob else "None identified"
+
+    pd_zone = pd.get("zone", "n/a") if pd.get("available") else "n/a"
+
+    if setup["state"] == "ENTRY":
+        if direction == "bullish":
+            entry = fvg["top"]
+            stop = min(fvg["bottom"], ob["low"] if ob else fvg["bottom"]) - 0.5
+        else:
+            entry = fvg["bottom"]
+            stop = max(fvg["top"], ob["high"] if ob else fvg["top"]) + 0.5
+        risk = abs(entry - stop)
+        tp1 = entry + risk if direction == "bullish" else entry - risk
+        tp2 = entry + risk * DEFAULT_RR_TARGET if direction == "bullish" else entry - risk * DEFAULT_RR_TARGET
+
+        header = f"{icon} <b>ENTRY ZONE — {('BUY' if direction=='bullish' else 'SELL')}</b>"
+        levels = (
+            f"Entry: {fmt_price(entry)}\n"
+            f"Stop: {fmt_price(stop)}\n"
+            f"TP1: {fmt_price(tp1)}\n"
+            f"TP2: {fmt_price(tp2)}\n"
+            f"Risk/Reward: 1:{DEFAULT_RR_TARGET:g}\n\n"
+        )
+    else:
+        header = f"{icon} <b>DEVELOPING — watching for retracement</b>"
+        levels = f"Price has not yet retraced into the {fvg_kind} ({direction}).\n\n"
+
+    return (
+        "🎯 <b>ICT SETUP — XAUUSD</b>\n\n"
+        f"{header}\n\n"
+        f"Sequence:\n"
+        f"1. {raid_label}\n"
+        f"2. {disp_label}\n"
+        f"3. {mss_label}\n"
+        f"4. {fvg_label}\n"
+        f"5. Order Block: {ob_label}\n\n"
+        f"{levels}"
+        f"Premium/Discount: {pd_zone}\n"
+        f"Session at raid: {setup['session_at_raid']} | Session now: {setup['session_now']}\n"
+        f"Candles since MSS: {setup['candles_since_mss']} (valid window: {ICT_VALIDITY_CANDLES})\n\n"
+        "SMT divergence: UNAVAILABLE — no correlated instrument feed (e.g. DXY) is configured.\n\n"
+        "⚠️ Analysis only. No broker orders are placed."
+    )
+
+
+@bot.message_handler(commands=["ict"])
+def ICT_cmd_ict(message: types.Message) -> None:
+    candles, err = fetch_candles(DEFAULT_INTERVAL, outputsize=max(ICT_SCAN_LOOKBACK + 30, CANDLE_COUNT))
+    if err:
+        bot.reply_to(message, f"⚠️ {err}")
+        return
+    setup = ICT_build_setup(candles)
+    bot.reply_to(message, ICT_format_setup(setup))
+
+
+_ICT_NEW_HANDLER_COUNT = 1
+bot.message_handlers = (
+    bot.message_handlers[-_ICT_NEW_HANDLER_COUNT:] + bot.message_handlers[:-_ICT_NEW_HANDLER_COUNT]
+)
 
 
 if __name__ == "__main__":
