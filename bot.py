@@ -882,9 +882,15 @@ def handle_tag(call):
 
 
 # ============================================================
-# RENDER KEEP-ALIVE
+# RENDER KEEP-ALIVE + AUTO-SCAN
 # ============================================================
 app = Flask(__name__)
+
+# Your Telegram user ID — only YOU get the auto-signals
+OWNER_CHAT_ID = 8353584732
+# Render gives your service a public URL — we ping ourselves
+SELF_URL = "https://telegram-trading-bot-a9c6.onrender.com"
+PING_INTERVAL_SECONDS = 600  # 10 minutes
 
 
 @app.route("/")
@@ -897,10 +903,65 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 
+def auto_scan_loop():
+    """Every 10 min: ping self + scan market + push signal if any."""
+    time.sleep(30)  # give the app time to boot
+    while True:
+        try:
+            try:
+                requests.get(SELF_URL, timeout=10)
+            except Exception:
+                pass
+
+            candles, err = fetch_candles()
+            if not err and candles:
+                setup = build_ict_setup(candles)
+                if setup.get("state") == "ENTRY":
+                    text = render_setup(candles)
+                    d = setup["direction"]
+                    fvg = setup["fvg"]
+                    ob = setup["order_block"]
+                    entry = fvg["top"] if d == "bullish" else fvg["bottom"]
+                    if d == "bullish":
+                        stop = (min(fvg["bottom"], ob["low"]) if ob else fvg["bottom"]) - 0.5
+                    else:
+                        stop = (max(fvg["top"], ob["high"]) if ob else fvg["top"]) + 0.5
+                    risk = abs(entry - stop)
+                    tp1 = entry + risk if d == "bullish" else entry - risk
+                    tp2 = entry + risk * DEFAULT_RR_TARGET if d == "bullish" else entry - risk * DEFAULT_RR_TARGET
+                    rec = {
+                        "ts": datetime.now(SAST).isoformat(),
+                        "symbol": SYMBOL,
+                        "timeframe": DEFAULT_INTERVAL,
+                        "session": ",".join(active_sessions()) or "none",
+                        "direction": d,
+                        "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
+                        "raid": str(setup["pool"]),
+                        "mss": str(setup["mss"]),
+                        "fvg": str(setup["fvg"]),
+                        "order_block": str(setup["order_block"]),
+                        "displacement": str(setup["displacement"]),
+                    }
+                    sid = log_signal(rec)
+                    try:
+                        bot.send_message(
+                            OWNER_CHAT_ID,
+                            "🔔 <b>AUTO-SIGNAL</b>\n\n" + text,
+                            reply_markup=outcome_kb(sid),
+                        )
+                    except Exception as e:
+                        log.error(f"Auto-signal send failed: {e}")
+        except Exception as e:
+            log.error(f"Auto-scan error: {e}")
+
+        time.sleep(PING_INTERVAL_SECONDS)
+
+
 def keep_alive():
     t = Thread(target=run_web, daemon=True)
     t.start()
-
+    s = Thread(target=auto_scan_loop, daemon=True)
+    s.start()
 
 # ============================================================
 # MAIN
