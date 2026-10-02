@@ -1074,7 +1074,6 @@ def main() -> None:
             )
         except Exception as e:
             logging.error(f"Polling error encountered: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
 
 
 # ============================================================================
@@ -1228,6 +1227,11 @@ def ICT_price_in_zone(candles, zone_low, zone_high):
     return last["low"] <= zone_high and last["high"] >= zone_low
 
 
+def LPX_active_session_label(dt_sast):
+    active, _ = active_sessions(dt_sast)
+    return ", ".join(active) if active else "Off-hours"
+
+
 def ICT_build_setup(candles):
     structure = market_structure_report(candles)
     swings = structure["swings"]
@@ -1367,3 +1371,4 @@ bot.message_handlers = (
 
 if __name__ == "__main__":
     main()
+
