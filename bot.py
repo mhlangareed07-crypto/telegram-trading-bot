@@ -1237,54 +1237,60 @@ def ICT_build_setup(candles):
     swings = structure["swings"]
     pools = ICT_liquidity_pools(candles, swings)
     raids = ICT_find_raids(candles, pools)
-
+    
     for raid in raids:
         direction = raid["reversal_direction"]
+        
         mss = ICT_find_mss(candles, raid["idx"], direction, ICT_VALIDITY_CANDLES)
         if not mss:
             continue
-        displacement = ICT_find_displacement(candles, raid["idx"] + 1, mss["idx"], direction)
-        if not displacement:
-            continue
-        fvg = ICT_find_fvg_near(candles, mss["idx"], mss["idx"], direction)
-        if not fvg:
-            continue
+            
         if ICT_check_invalidated(candles, raid, mss, direction):
             continue
 
+        displacement = ICT_find_displacement(candles, raid["idx"] + 1, mss["idx"], direction)
+        fvg = ICT_find_fvg_near(candles, mss["idx"], mss["idx"], direction)
         ob = ICT_find_order_block(candles, raid["idx"], mss["idx"], direction)
-        zone_low, zone_high = fvg["bottom"], fvg["top"]
+        
+        confluence_score = sum([
+            bool(displacement),
+            bool(fvg),
+            bool(ob)
+        ])
+        
+        if confluence_score < 2:
+            continue
+
+        zone_low = fvg["bottom"] if fvg else mss["level"]
+        zone_high = fvg["top"] if fvg else mss["level"]
         in_zone_now = ICT_price_in_zone(candles, zone_low, zone_high)
         candles_since_mss = (len(candles) - 1) - mss["idx"]
         still_valid_window = candles_since_mss <= ICT_VALIDITY_CANDLES
-
+        
         pd = premium_discount_report(candles, max(raid["pool"]["price"], mss["level"]),
-                                      min(raid["pool"]["price"], mss["level"]))
-
+                                     min(raid["pool"]["price"], mss["level"]))
+        
         setup = {
             "direction": direction,
             "pool": raid["pool"],
             "raid_idx": raid["idx"],
             "mss": mss,
-            "displacement": displacement,
-            "fvg": fvg,
-            "fvg_is_inversion": ICT_fvg_filled_before_last(candles, fvg),
+            "displacement": displacement or {"detected": False},
+            "fvg": fvg or {"bottom": mss["level"], "top": mss["level"], "type": direction, "i": mss["idx"]},
+            "fvg_is_inversion": ICT_fvg_filled_before_last(candles, fvg) if fvg else False,
             "order_block": ob,
             "premium_discount": pd,
             "session_at_raid": LPX_active_session_label(candles[raid["idx"]]["dt"].astimezone(SAST)),
             "session_now": LPX_active_session_label(candles[-1]["dt"].astimezone(SAST)),
             "candles_since_mss": candles_since_mss,
         }
-
-        if in_zone_now and still_valid_window:
-            setup["state"] = "ENTRY"
-            return setup
+        
         if still_valid_window:
-            setup["state"] = "DEVELOPING"
+            setup["state"] = "ENTRY" if in_zone_now else "DEVELOPING"
             return setup
-        continue
-
+            
     return {"state": "NONE"}
+
 
 
 def ICT_format_setup(setup: dict) -> str:
